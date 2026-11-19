@@ -3819,6 +3819,21 @@ function buildRingPlugin(surgeBody) {
   return { body: header.join('\n') + '\n\n' + bodyParts.join('\n\n') + '\n', warnings }
 }
 
+function escapeRingQuotedValue(value) {
+  // Ring 配置语法: 双引号必须包裹整个词元且内部引号须以 \" 转义;
+  // 上游解析会剥掉源模块里的 \" 转义, 此处按 Ring 语法重新转义
+  const v = value.trim()
+  if (v.length < 2 || !v.startsWith('"') || !v.endsWith('"')) return value
+  const inner = v.slice(1, -1)
+  let out = ''
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]
+    if (ch === '"' && inner[i - 1] !== '\\') out += '\\"'
+    else out += ch
+  }
+  return '"' + out + '"'
+}
+
 function ringScriptLine(line, warn, checkLookahead) {
   const trimmed = line.trim()
   if (!trimmed) return line
@@ -3852,6 +3867,7 @@ function ringScriptLine(line, warn, checkLookahead) {
     if (key === 'cronexp' && /\s/.test(value) && !/^\s*["'].*["']\s*$/.test(value)) {
       value = `"${value.trim()}"`
     }
+    value = escapeRingQuotedValue(value)
     kept.push(`${key}=${value}`)
   }
   if (type && !RING_SCRIPT_TYPES.includes(type)) {
