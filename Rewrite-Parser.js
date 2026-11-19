@@ -42,7 +42,11 @@ const queryObject = parseQueryString(urlArg)
 // 来源
 const fromType = queryObject.type
 //目标app
-const targetApp = queryObject.target
+const rawTargetApp = queryObject.target
+// Ring 插件语法与 Surge 模块最接近：target=ring-plugin 时管线内按 surge-module
+// 走完既有解析/组装，输出前再由 buildRingPlugin() 做 Ring 化后处理
+const isRingPlugin = rawTargetApp == 'ring-plugin'
+const targetApp = isRingPlugin ? 'surge-module' : rawTargetApp
 const app = targetApp.split('-')[0]
 const isSurgeiOS = targetApp == 'surge-module'
 const isStashiOS = targetApp == 'stash-stoverride'
@@ -2178,6 +2182,15 @@ ${providers}
     body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
   }
 
+  // Ring 插件后处理：把 Surge 模块形态的 body 转为 Ring 插件（规则见 buildRingPlugin）
+  let ringWarningText = ''
+  if (isRingPlugin) {
+    const ringConverted = buildRingPlugin(body)
+    body = ringConverted.body
+    ringWarningText =
+      ringConverted.warnings.length > 0 ? `Ring 转换警告:\n${ringConverted.warnings.join('\n')}` : ''
+  }
+
   eval(evJsmodi)
   eval(evUrlmodi)
 
@@ -2190,6 +2203,7 @@ ${providers}
       : ''
 
   otherRule = (otherRule[0] || '') && `${app}不支持以下内容:\n${otherRule.join('\n')}`
+  if (isRingPlugin && otherRule) otherRule = otherRule.replace(/^surge/, 'Ring')
 
   notBuildInPolicy =
     (notBuildInPolicy[0] || '') && `不是${app}内置策略且未指定策略的规则:\n${notBuildInPolicy.join('\n')}`
@@ -2198,6 +2212,7 @@ ${providers}
   shNotify(loonV2WarningText)
   shNotify(targetCompatibilityWarningText)
   shNotify(notBuildInPolicy)
+  shNotify(ringWarningText)
 
   if (openMsgHtml) {
     result = {
@@ -3649,6 +3664,201 @@ function getSurgeArgumentDefault(item, isRuleToggle = false) {
   if (isRuleToggle) return getSwitchDefault(value) == 'true' ? '' : '#'
   if (item.type == 'switch') return getSwitchDefault(value)
   return quoteIfNeeded(splitTopLevel(value, ',')[0] || value)
+}
+
+// ================= Ring 插件后处理 =================
+// Ring 插件语法与 Surge 模块最接近，主管线按 surge-module 组装后由本函数收尾：
+// #! 元信息转为头部注释、{{{参数}}} 烘焙默认值、[Script] 行只保留 Ring 支持的参数、
+// Ring 不支持的段/键丢弃并汇总警告（警告同时写入输出头部注释块与 shNotify 通知）。
+const RING_SCRIPT_TYPES = ['http-request', 'http-response', 'dns', 'rule', 'generic', 'cron', 'event']
+const RING_SCRIPT_KEYS = new Set([
+  'type',
+  'pattern',
+  'script-path',
+  'timeout',
+  'argument',
+  'requires-body',
+  'max-size',
+  'binary-body-mode',
+  'cronexp',
+  'event-name',
+  'engine',
+  'script-update-interval',
+  'debug',
+])
+const RING_KEEP_SECTIONS = new Set([
+  'Rule',
+  'URL Rewrite',
+  'Header Rewrite',
+  'Host',
+  'MITM',
+  'Script',
+  'Proxy',
+  'Proxy Group',
+  'Proxy Resource',
+  'Keystore',
+  'Response',
+])
+const RING_DROP_SECTIONS = {
+  Panel: 'Ring 没有 [Panel] 段',
+  'Map Local': 'Ring 没有 [Map Local] 段（本地模拟响应在 Ring 中用 [Response]，语法不同，未自动转换）',
+  'Body Rewrite': 'Ring 没有 [Body Rewrite] 段（正文重写需改用 http-request/http-response 脚本实现）',
+  Argument: 'Ring 插件没有参数声明机制（参数已烘焙默认值）',
+  Plugin: 'Ring 插件不能嵌套 [Plugin] 段',
+}
+const RING_LOOKAHEAD = /\(\?<?[=!]/
+
+function buildRingPlugin(surgeBody) {
+  const warnings = []
+  const warn = msg => warnings.push(msg)
+  const checkLookahead = (pattern, where) => {
+    if (pattern && RING_LOOKAHEAD.test(pattern)) {
+      warn(
+        `${where} 的正则包含环视 (?= / (?! / (?<= / (?<!，Ring 使用 Rust regex 引擎不支持环视，运行时可能报错: ${pattern}`
+      )
+    }
+  }
+
+  // 1) 烘焙参数模板：{{{key}}} 用 #!arguments 的默认值（与 Surge 自身默认取值规则一致，
+  //    含 switch 与行首启停开关参数的 ''/'#' 语义）；未声明默认值的剥离并警告。
+  const defaults = {}
+  for (const item of sgArg) {
+    defaults[item.key] = getSurgeArgumentDefault(item, surgeRuleToggleArgs.has(item.key))
+  }
+  let text = `${surgeBody ?? ''}`
+  text = text.replace(/\{\{\{([^{}]+)\}\}\}/g, (m, rawKey) => {
+    const key = rawKey.trim()
+    if (Object.prototype.hasOwnProperty.call(defaults, key)) return defaults[key]
+    warn(`参数模板 ${key} 未在 #!arguments 中声明默认值，已剥离`)
+    return ''
+  })
+  // 已知参数的单括号 {key} 残留同样烘焙（键名必须命中声明表，不误伤 {2,3} 类正则量词）
+  text = text.replace(/\{([A-Za-z_][\w-]*)\}/g, (m, key) =>
+    Object.prototype.hasOwnProperty.call(defaults, key) ? defaults[key] : m
+  )
+
+  // 2) 逐段处理
+  const metaComments = []
+  const outSections = []
+  let current = null
+  const flush = () => {
+    if (current) outSections.push(current)
+    current = null
+  }
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.replace(/\s+$/, '')
+    const sectionMatch = line.match(/^\s*\[(.+)\]\s*$/)
+    if (sectionMatch) {
+      flush()
+      current = { name: sectionMatch[1].trim(), lines: [] }
+      continue
+    }
+    if (!current) {
+      // 段前区：#! 元信息 → 注释（arguments 已烘焙，不再输出声明行）
+      const meta = line.match(/^#!([^=\s]+)\s*=\s*(.*)$/)
+      if (meta) {
+        if (meta[1] === 'arguments' || meta[1] === 'arguments-desc') continue
+        metaComments.push(`# ${meta[1]}: ${meta[2]}`)
+      } else if (line.trim()) {
+        metaComments.push(line.startsWith('#') ? line : `# ${line}`)
+      }
+      continue
+    }
+    current.lines.push(line)
+  }
+  flush()
+
+  const keptSections = []
+  for (const section of outSections) {
+    const { name } = section
+    const nonEmpty = section.lines.filter(l => l.trim())
+    if (RING_DROP_SECTIONS[name]) {
+      if (nonEmpty.length > 0) warn(`已丢弃 [${name}] 段（${nonEmpty.length} 行）：${RING_DROP_SECTIONS[name]}`)
+      continue
+    }
+    if (name === 'General') {
+      // force-http-engine-hosts / skip-proxy / always-real-ip 等均为 Surge 专属键
+      for (const l of nonEmpty) {
+        if (/^#/.test(l.trim())) continue
+        warn(`已丢弃 Surge 专属 [General] 键: ${l.split('=')[0].trim()}（Ring 的 [General] 没有对应键）`)
+      }
+      continue
+    }
+    if (!RING_KEEP_SECTIONS.has(name)) {
+      if (nonEmpty.length > 0) warn(`已跳过无法映射的段 [${name}]（${nonEmpty.length} 行）`)
+      continue
+    }
+    if (name === 'Script') {
+      section.lines = section.lines.map(l => ringScriptLine(l, warn, checkLookahead)).filter(l => l !== null)
+    } else if (name === 'URL Rewrite' || name === 'Header Rewrite') {
+      for (const l of nonEmpty) {
+        if (/^#/.test(l.trim())) continue
+        checkLookahead(l.trim().split(/\s+/)[0], `[${name}]`)
+      }
+    } else if (name === 'Rule') {
+      for (const l of nonEmpty) {
+        if (/^#/.test(l.trim())) continue
+        if (/URL-REGEX/i.test(l)) checkLookahead(l, '[Rule]')
+      }
+    }
+    if (section.lines.some(l => l.trim())) keptSections.push(section)
+  }
+
+  // 3) 组装：头部注释（元信息 + 烘焙说明 + 警告汇总）+ 各段
+  const header = ['# ===== Ring 插件（由 Script Hub 从 Surge 模块 / Loon 插件 / QX 重写转换） =====', ...metaComments]
+  for (const [k, v] of Object.entries(defaults)) {
+    header.push(`# 参数烘焙: ${k} = ${v === '' ? '(空)' : v}（Ring 插件无参数机制，原模板参数已替换为默认值）`)
+  }
+  if (warnings.length > 0) {
+    header.push(`# ===== 转换警告（${warnings.length} 条） =====`)
+    for (const w of warnings) header.push(`# [警告] ${w}`)
+  }
+  const bodyParts = keptSections.map(
+    s => `[${s.name}]\n${s.lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()}`
+  )
+  return { body: header.join('\n') + '\n\n' + bodyParts.join('\n\n') + '\n', warnings }
+}
+
+function ringScriptLine(line, warn, checkLookahead) {
+  const trimmed = line.trim()
+  if (!trimmed) return line
+  if (/^#/.test(trimmed)) return line // 注释掉的脚本行原样保留
+  const [namePart, rest] = splitFirstTopLevel(trimmed, '=')
+  const name = namePart.trim()
+  if (!rest || !/type\s*=/.test(rest)) {
+    warn(`[Script] 行无法解析，已跳过: ${trimmed}`)
+    return null
+  }
+  // 按顶层逗号拆键值对；不带 = 的碎片（正则中的裸逗号）并回前一片
+  const parts = []
+  for (const p of splitTopLevel(rest)) {
+    if (!/^[A-Za-z-]+\s*=/.test(p) && parts.length > 0) parts[parts.length - 1] += ',' + p
+    else parts.push(p)
+  }
+  const kept = []
+  let type = ''
+  let pattern = ''
+  for (const p of parts) {
+    const [rawKey, rawValue] = splitFirstTopLevel(p, '=')
+    const key = rawKey.trim()
+    let value = rawValue
+    if (key === 'type') type = (value || '').trim()
+    if (key === 'pattern') pattern = value || ''
+    if (!RING_SCRIPT_KEYS.has(key)) {
+      warn(`[Script]「${name}」参数 ${key} 不是 Ring 支持的参数，已丢弃`)
+      continue
+    }
+    // Ring 文档要求含空格的 cronexp 用引号包裹（Surge 组装阶段会剥掉原引号）
+    if (key === 'cronexp' && /\s/.test(value) && !/^\s*["'].*["']\s*$/.test(value)) {
+      value = `"${value.trim()}"`
+    }
+    kept.push(`${key}=${value}`)
+  }
+  if (type && !RING_SCRIPT_TYPES.includes(type)) {
+    warn(`[Script]「${name}」类型 type=${type} 不在 Ring 支持的脚本类型内，已保留原文，请人工确认`)
+  }
+  checkLookahead(pattern, `[Script]「${name}」`)
+  return `${name} = ${kept.join(', ')}`
 }
 
 function formatLoonArgumentValue(item, type = item.type, isRuleToggle = false) {
